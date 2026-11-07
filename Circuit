@@ -1,0 +1,45 @@
+# 🔌 Circuit – Hardware Configuration
+
+This section documents the hardware components, pin assignments, and power connections used in the **Mimo Digital Pet** project.
+
+## 1. Hardware Components
+
+| S. No. | Component | Specification |
+|---:|---|---|
+| 1 | Microcontroller | ESP32 DevKit V1 |
+| 2 | OLED Display | 1.3-inch SH1106, 128 × 64 |
+| 3 | Touch Sensor | TTP223 Capacitive Touch Sensor |
+| 4 | Servo Motor | SG90 Micro Servo |
+
+## 2. Pin Configuration
+
+| Component | Pin | ESP32 GPIO |
+|---|---|---|
+| OLED Display | SDA | GPIO 21 |
+| OLED Display | SCL | GPIO 22 |
+| Touch Sensor | OUT | GPIO 4 |
+| Servo Motor | Signal | GPIO 18 |
+
+## 3. Power Configuration
+
+| Component | Power Supply |
+|---|---|
+| ESP32 | USB power |
+| OLED Display | 3.3V from ESP32 |
+| TTP223 Sensor | 3.3V from ESP32 |
+| SG90 Servo | External regulated 5V supply |
+
+**Common Ground:** The external servo power supply GND must be connected to the ESP32 GND.
+
+## 4. Interface Details
+
+- **I²C Communication:** The OLED display communicates with the ESP32 through the I²C interface.
+- **Digital Input:** The TTP223 sensor sends touch detection signals to GPIO 4.
+- **PWM Control:** The SG90 servo receives its control signal from GPIO 18.
+
+## 5. Hardware Notes
+
+- Verify pin connections before powering the system.
+- Use a suitable regulated power supply for the servo motor.
+- Ensure a common ground between the ESP32 and external servo supply.
+- Avoid powering the servo directly from the ESP32 3.3V pin.
