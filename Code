@@ -1,0 +1,1045 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <time.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SH110X.h>
+#include <ESP32Servo.h>
+#include <ArduinoJson.h>
+
+// ===================== USER CONFIGURATION =====================
+const char* WIFI_SSID = "Your_Wifi_Name";
+const char* WIFI_PASS = "Your_Wifi_Password";
+
+// Chennai, Tamil Nadu
+const char* WEATHER_URL =
+  "https://api.open-meteo.com/v1/forecast?latitude=13.0827&longitude=80.2707"
+  "&current=temperature_2m,relative_humidity_2m,weather_code&timezone=Asia%2FKolkata";
+
+// ===================== PINS / HARDWARE =====================
+#define PIN_SDA    21
+#define PIN_SCL    22
+#define PIN_TOUCH   4
+#define PIN_SERVO  18
+#define OLED_ADDR  0x3C
+#define SCREEN_W   128
+#define SCREEN_H    64
+
+#define C_ON  SH110X_WHITE
+#define C_OFF SH110X_BLACK
+
+// ===================== TOUCH TUNING =====================
+const uint32_t DEBOUNCE_MS       = 30;    // ignore glitches shorter than this
+const uint32_t MAX_TAP_MS        = 700;   // press longer than this is not a tap
+const uint32_t DOUBLE_TAP_GAP_MS = 500;   // max gap between taps of a double tap
+const uint32_t LONG_PRESS_MS     = 2000;  // hold time to trigger long press
+
+// ===================== BEHAVIOUR TUNING =====================
+const uint32_t HAPPY_DURATION_MS = 3000;
+const uint32_t SAD_TIMEOUT_MS    = 20000;
+const uint32_t STARTUP_MS        = 2000;
+const uint32_t WEATHER_REFRESH_MS= 5UL * 60UL * 1000UL;  // 5 minutes
+const uint32_t WEATHER_RETRY_MS  = 30UL * 1000UL;        // retry after failure
+const uint32_t WEATHER_STALE_MS  = 10UL * 60UL * 1000UL; // mark "OLD" after this
+const uint32_t WIFI_RETRY_MS     = 20UL * 1000UL;
+const uint32_t DISPLAY_RETRY_MS  = 3000;                 // re-try OLED init if it was not found
+const uint32_t FRAME_CHECK_MS    = 33;                   // how often the screen logic is evaluated
+
+// ===================== BLINK TUNING =====================
+const uint32_t BLINK_PERIOD_MS   = 2000;    // a blink starts every 2 seconds
+const float    BLINK_MS          = 240.0f;  // duration of one blink (half-shut -> shut -> half-shut)
+const bool     BLINK_WHEN_HAPPY  = false;   // HAPPY eyes are already closed arcs, so no blink there
+
+// ===================== EYE GEOMETRY (kept from original) =====================
+const int EYE_R     = 15;   // outer radius of the striped ring
+const int RING_IN   = 10;   // inner radius of the ring (ring thickness = 5)
+const int PUPIL_R   = 6;    // pupil outer radius (bright outline)
+const int EYE_CY    = 31;   // vertical centre
+const int LEFT_CX   = 40;
+const int RIGHT_CX  = 88;
+const int PUPIL_DX  = 1;    // default pupil offset (slightly right/down like the photo)
+const int PUPIL_DY  = 1;
+
+// ===================== SERVO DANCE =====================
+const uint8_t  DANCE_ANGLES[] = {50, 130, 50, 130, 50, 130, 50, 130, 50, 130, 50, 130, 75};
+const uint8_t  DANCE_STEPS    = sizeof(DANCE_ANGLES) / sizeof(DANCE_ANGLES[0]);
+const uint32_t DANCE_STEP_MS  = 200;   // an SG90 needs ~150-200 ms for an 80 degree swing; 13 steps = 2.6 s
+
+// ===================== TYPES =====================
+enum AppMode    : uint8_t { MODE_STARTUP, MODE_PET, MODE_MENU, MODE_CLOCK, MODE_WEATHER };
+enum PetState   : uint8_t { PET_NORMAL, PET_HAPPY, PET_ANGRY, PET_SAD };
+enum TouchEvent : uint8_t { TOUCH_NONE, TOUCH_SINGLE, TOUCH_DOUBLE, TOUCH_TRIPLE, TOUCH_LONG };
+
+struct WeatherData {
+  bool     valid = false;
+  float    tempC = 0;
+  int      humidity = 0;
+  int      code = 0;
+  uint32_t updatedAt = 0;
+};
+
+// ===================== FUNCTION DECLARATIONS =====================
+void attachServo();
+void startDance();
+void stopDance();
+void servoService(uint32_t now);
+TouchEvent readTouch();
+void handleTouch(TouchEvent ev, uint32_t now);
+void setPet(PetState s);
+void updatePet(uint32_t now);
+void updateGaze();
+void updateBlink(uint32_t now);
+float blinkAmount(uint32_t now);
+uint8_t blinkPhase(uint32_t now);
+void enterPet();
+void enterMenu();
+bool initDisplay();
+void displayService(uint32_t now);
+void renderFrame(uint32_t now);
+void drawStartup();
+void drawPet(uint32_t now, bool force);
+void drawNormalEyeShapes();
+void drawEyes(bool closed);
+void drawHalfLidEyes();
+void drawHappyEyes();
+void drawAngryEyes();
+void drawSadEyes(bool closed);
+void drawBlinkEyes();
+void drawMenu(bool force);
+void drawClock(bool force);
+void drawWeather(uint32_t now, bool force);
+void drawCentered(const char* s, int y, uint8_t size);
+void drawTwoLines(const char* l1, const char* l2);
+const char* weatherText(int code);
+void wifiService(uint32_t now);
+bool fetchWeather();
+void weatherTask(void* param);
+
+// ===================== GLOBALS =====================
+Adafruit_SH1106G display(SCREEN_W, SCREEN_H, &Wire, -1);
+Servo servo;
+bool displayReady = false;
+uint32_t lastDisplayInit = 0;
+
+AppMode  mode = MODE_STARTUP;
+PetState petState = PET_NORMAL;
+uint32_t stateSince = 0;
+uint32_t lastActivity = 0;
+uint32_t startupAt = 0;
+uint32_t lastFrame = 0;
+bool     needRedraw = true;      // set whenever a screen must be repainted regardless of change detection
+
+// Menu
+const char* MENU_ITEMS[3] = {"1. NORMAL", "2. CLOCK", "3. WEATHER"};
+uint8_t menuIndex = 0;
+
+// Gaze / blink
+float gazeX = 0, gazeY = 0, gazeTX = 0, gazeTY = 0;   // gaze is tracked but the NORMAL eye design is unchanged
+uint32_t nextGazeAt = 0;
+bool blinking = false;
+uint32_t blinkStart = 0, nextBlinkAt = 0;
+uint8_t lastPetKey = 0xFF;       // change detection: (pet state, blink phase)
+
+// Servo
+bool servoAttached = false;
+bool danceActive = false;
+uint8_t danceStep = 0;
+uint32_t danceLastStep = 0;
+uint32_t servoDetachAt = 0;
+
+// Touch
+struct TouchState {
+  bool lastRaw = false;
+  bool stable = false;
+  uint32_t rawChangedAt = 0;
+  uint32_t pressStart = 0;
+  bool longFired = false;
+  uint8_t tapCount = 0;
+  uint32_t lastTapRelease = 0;
+} ts;
+
+// Wi-Fi / weather
+uint32_t lastWifiAttempt = 0;
+WeatherData weather;
+portMUX_TYPE weatherMux = portMUX_INITIALIZER_UNLOCKED;
+volatile bool weatherFetching = false;
+volatile bool weatherLastFailed = false;
+
+// =====================================================================
+//                               SETUP
+// =====================================================================
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\nMIMO starting...");
+  randomSeed(esp_random());
+
+  pinMode(PIN_TOUCH, INPUT_PULLDOWN);
+
+  // OLED: scan both common I2C addresses before initialising.
+  Wire.begin(PIN_SDA, PIN_SCL);
+  Wire.setClock(100000); // conservative clock for reliable wiring on a small prototype
+  initDisplay();
+  lastDisplayInit = millis();
+
+  // Servo: allocate timers, centre briefly, then detach (prevents jitter)
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  ESP32PWM::allocateTimer(2);
+  ESP32PWM::allocateTimer(3);
+  attachServo();
+  servo.write(90);
+  servoDetachAt = millis() + 700;
+
+  // Wi-Fi (non-blocking) + NTP (Asia/Kolkata, UTC+5:30)
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  lastWifiAttempt = millis();
+  configTzTime("IST-5:30", "pool.ntp.org", "time.google.com", "time.nist.gov");
+
+  // Weather runs in a background task so HTTPS never freezes the animations.
+  // 16 KB stack: HTTPS/TLS needs more than the previous 10 KB.
+  xTaskCreatePinnedToCore(weatherTask, "weather", 16384, nullptr, 1, nullptr, 0);
+
+  // Startup screen
+  drawStartup();
+  startupAt = millis();
+  nextBlinkAt = millis() + BLINK_PERIOD_MS;
+  mode = MODE_STARTUP;
+}
+
+// =====================================================================
+//                                LOOP
+// =====================================================================
+void loop() {
+  uint32_t now = millis();
+
+  wifiService(now);
+  servoService(now);
+  displayService(now);
+
+  TouchEvent ev = readTouch();
+  if (ev != TOUCH_NONE) handleTouch(ev, millis());
+
+  // readTouch()/setPet() stamp lastActivity/stateSince with a NEWER millis() than the
+  // `now` captured at the top of loop(). Without refreshing, (now - lastActivity) wraps
+  // to a huge unsigned number and the pet instantly jumps to SAD (or ends HAPPY at once).
+  now = millis();
+
+  switch (mode) {
+    case MODE_STARTUP:
+      if (now - startupAt >= STARTUP_MS) enterPet();
+      break;
+    case MODE_PET:
+      updatePet(now);
+      updateBlink(now);       // blink timing is independent of drawing, touch, servo and Wi-Fi
+      break;
+    default:
+      break;
+  }
+
+  renderFrame(now);
+}
+
+// =====================================================================
+//                       DISPLAY INIT / FRAME SCHEDULER
+// =====================================================================
+// Scans 0x3C / 0x3D and starts the SH1106. Safe to call again if the OLED
+// was missing at boot (loose wire, slow power-up): nothing here can hang.
+bool initDisplay() {
+  uint8_t oledAddress = 0;
+  const uint8_t candidates[] = {OLED_ADDR, 0x3D};
+  for (uint8_t addr : candidates) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      oledAddress = addr;
+      break;
+    }
+  }
+  if (oledAddress != 0 && display.begin(oledAddress, true)) {
+    displayReady = true;
+    display.setTextWrap(false);
+    display.setTextColor(C_ON);
+    display.clearDisplay();
+    display.display();
+    Serial.printf("OLED detected at 0x%02X\n", oledAddress);
+    return true;
+  }
+  displayReady = false;
+  Serial.println("ERROR: OLED not detected at 0x3C or 0x3D. Check VCC, GND, SDA=21, SCL=22.");
+  return false;
+}
+
+// If the OLED was not found, keep trying every few seconds without blocking.
+void displayService(uint32_t now) {
+  if (displayReady) return;
+  if ((now - lastDisplayInit) < DISPLAY_RETRY_MS) return;
+  lastDisplayInit = now;
+  if (initDisplay()) needRedraw = true;
+}
+
+// Evaluates the active screen at most every FRAME_CHECK_MS. Each draw function
+// only sends data to the OLED when what it shows has actually changed, so the
+// panel is not re-flashed 10-30 times a second with identical content.
+void renderFrame(uint32_t now) {
+  if (!displayReady) return;
+  if (!needRedraw && (now - lastFrame) < FRAME_CHECK_MS) return;
+  lastFrame = now;
+  bool force = needRedraw;
+  needRedraw = false;
+
+  switch (mode) {
+    case MODE_STARTUP: if (force) drawStartup();       break;
+    case MODE_PET:     updateGaze(); drawPet(now, force); break;
+    case MODE_MENU:    drawMenu(force);                break;
+    case MODE_CLOCK:   drawClock(force);               break;
+    case MODE_WEATHER: drawWeather(now, force);        break;
+  }
+}
+
+// =====================================================================
+//                         TOUCH DETECTION
+// =====================================================================
+// Debounced state machine. Returns at most one event per call:
+//  SINGLE : one short tap, confirmed after DOUBLE_TAP_GAP_MS of silence
+//  DOUBLE : two short taps in quick succession
+//  LONG   : fires once while still holding, at LONG_PRESS_MS.
+//           The release afterwards is ignored (no tap is generated).
+TouchEvent readTouch() {
+  uint32_t now = millis();
+  bool raw = (digitalRead(PIN_TOUCH) == HIGH);
+
+  if (raw != ts.lastRaw) { ts.lastRaw = raw; ts.rawChangedAt = now; }
+
+  if ((now - ts.rawChangedAt) >= DEBOUNCE_MS && raw != ts.stable) {
+    ts.stable = raw;
+    if (ts.stable) {                       // ---- pressed
+      ts.pressStart = now;
+      ts.longFired = false;
+      lastActivity = now;
+    } else {                               // ---- released
+      lastActivity = now;
+      if (!ts.longFired && (now - ts.pressStart) <= MAX_TAP_MS) {
+        if (ts.tapCount < 3) ts.tapCount++;
+        ts.lastTapRelease = now;
+      } else {
+        ts.tapCount = 0;                   // long/medium hold: not a tap
+      }
+    }
+  }
+
+  // Long press while still held
+  if (ts.stable && !ts.longFired && (now - ts.pressStart) >= LONG_PRESS_MS) {
+    ts.longFired = true;
+    ts.tapCount = 0;
+    Serial.println("Touch: LONG");
+    return TOUCH_LONG;
+  }
+
+  // Wait for the tap sequence to finish so 1, 2 and 3 taps are distinguished.
+  if (!ts.stable && !ts.lastRaw && ts.tapCount >= 3) {
+    ts.tapCount = 0;
+    Serial.println("Touch: TRIPLE");
+    return TOUCH_TRIPLE;
+  }
+
+  if (!ts.stable && !ts.lastRaw && ts.tapCount > 0 &&
+      (now - ts.lastTapRelease) >= DOUBLE_TAP_GAP_MS) {
+    uint8_t completedTaps = ts.tapCount;
+    ts.tapCount = 0;
+    if (completedTaps == 2) {
+      Serial.println("Touch: DOUBLE");
+      return TOUCH_DOUBLE;
+    }
+    Serial.println("Touch: SINGLE");
+    return TOUCH_SINGLE;
+  }
+  return TOUCH_NONE;
+}
+
+// =====================================================================
+//                         EVENT HANDLING
+// =====================================================================
+void handleTouch(TouchEvent ev, uint32_t now) {
+  lastActivity = now;
+  switch (mode) {
+    case MODE_STARTUP:
+      break;
+
+    case MODE_PET:
+      if (ev == TOUCH_LONG) {
+        enterMenu();
+      } else if (ev == TOUCH_TRIPLE) {
+        setPet(PET_ANGRY);                     // angry ONLY comes from 3 quick taps
+      } else if (ev == TOUCH_SINGLE) {
+        // One tap in NORMAL / SAD / ANGRY -> HAPPY (servo dances), then back to NORMAL.
+        if (petState != PET_HAPPY) setPet(PET_HAPPY);
+      }
+      // Double taps intentionally do nothing in pet mode.
+      break;
+
+    case MODE_MENU:
+      if (ev == TOUCH_SINGLE) {
+        menuIndex = (menuIndex + 1) % 3;
+        Serial.printf("Menu: highlight %d\n", menuIndex);
+      } else if (ev == TOUCH_DOUBLE) {
+        Serial.printf("Menu: select %d\n", menuIndex);
+        if (menuIndex == 0)      enterPet();
+        else if (menuIndex == 1) mode = MODE_CLOCK;
+        else                     mode = MODE_WEATHER;
+        needRedraw = true;                               // redraw immediately
+      } else if (ev == TOUCH_LONG) {
+        enterPet();                                      // back to home screen
+      }
+      break;
+
+    case MODE_CLOCK:
+    case MODE_WEATHER:
+      if (ev == TOUCH_LONG || ev == TOUCH_DOUBLE) {      // hold or double tap = menu
+        enterMenu();
+      }
+      break;
+  }
+}
+
+void enterPet() {
+  mode = MODE_PET;
+  setPet(PET_NORMAL);
+  gazeX = gazeY = gazeTX = gazeTY = 0;
+  nextGazeAt = millis() + 1500;
+  nextBlinkAt = millis() + BLINK_PERIOD_MS;
+  blinking = false;
+  lastActivity = millis();
+  lastPetKey = 0xFF;
+  needRedraw = true;
+}
+
+void enterMenu() {
+  stopDance();
+  menuIndex = 0;
+  mode = MODE_MENU;
+  needRedraw = true;                                     // redraw immediately
+}
+
+// =====================================================================
+//                            PET LOGIC
+// =====================================================================
+void setPet(PetState s) {
+  uint32_t now = millis();
+  PetState prev = petState;
+  petState = s;
+  stateSince = now;
+  if (s == PET_HAPPY) startDance();
+  else if (prev == PET_HAPPY) stopDance();
+  if (s == PET_NORMAL) lastActivity = now;   // restart the 20 s sadness timer
+}
+
+void updatePet(uint32_t now) {
+  // Signed differences: never wrap if a timestamp is a millisecond newer than `now`.
+  if (petState == PET_HAPPY && (int32_t)(now - stateSince) >= (int32_t)HAPPY_DURATION_MS) {
+    setPet(PET_NORMAL);
+  } else if ((petState == PET_NORMAL || petState == PET_ANGRY) &&
+             (int32_t)(now - lastActivity) >= (int32_t)SAD_TIMEOUT_MS) {
+    setPet(PET_SAD);
+  }
+}
+
+void updateGaze() {
+  uint32_t now = millis();
+  if (now >= nextGazeAt) {
+    if (random(0, 3) == 0) { gazeTX = 0; gazeTY = 0; }
+    else { gazeTX = random(-3, 4); gazeTY = random(-2, 3); }
+    nextGazeAt = now + random(1500, 4000);
+  }
+  gazeX += (gazeTX - gazeX) * 0.22f;     // easing = smooth motion
+  gazeY += (gazeTY - gazeY) * 0.22f;
+}
+
+// Blink scheduler: a new blink STARTS every BLINK_PERIOD_MS (2 s) and lasts
+// BLINK_MS. Runs every loop() pass, so it never depends on how often the
+// screen is drawn and never waits on the touch, servo, clock or weather code.
+void updateBlink(uint32_t now) {
+  if (!blinking) {
+    if ((int32_t)(now - nextBlinkAt) >= 0) {
+      blinking = true;
+      blinkStart = now;
+      nextBlinkAt = now + BLINK_PERIOD_MS;
+    }
+  } else if ((float)(now - blinkStart) >= BLINK_MS) {
+    blinking = false;               // the eyes ALWAYS reopen here
+  }
+}
+
+// Eyelid closure 0.0 (open) .. 1.0 (closed). Pure function: no side effects.
+float blinkAmount(uint32_t now) {
+  if (!blinking) return 0.0f;
+  float t = (float)(now - blinkStart);
+  if (t >= BLINK_MS) return 0.0f;
+  float half = BLINK_MS / 2.0f;
+  return (t < half) ? (t / half) : (1.0f - (t - half) / half);
+}
+
+// 0 = open, 1 = half-shut, 2 = fully shut
+uint8_t blinkPhase(uint32_t now) {
+  float a = blinkAmount(now);
+  if (a >= 0.6f) return 2;
+  if (a >= 0.2f) return 1;
+  return 0;
+}
+
+// =====================================================================
+//                              SERVO
+// =====================================================================
+void attachServo() {
+  if (!servoAttached) {
+    servo.setPeriodHertz(50);
+    servo.attach(PIN_SERVO, 500, 2400);
+    servoAttached = true;
+  }
+}
+
+void startDance() {
+  attachServo();
+  servoDetachAt = 0;
+  danceActive = true;
+  danceStep = 0;
+  danceLastStep = millis();
+  servo.write(DANCE_ANGLES[0]);
+}
+
+void stopDance() {
+  if (danceActive) {
+    danceActive = false;
+    if (servoAttached) { servo.write(90); servoDetachAt = millis() + 500; }
+  }
+}
+
+// Non-blocking dance sequencer; detaches the servo afterwards to stop jitter.
+void servoService(uint32_t now) {
+  if (danceActive && (now - danceLastStep) >= DANCE_STEP_MS) {
+    danceLastStep = now;
+    danceStep++;
+    if (danceStep >= DANCE_STEPS) {
+      danceActive = false;
+      servo.write(90);
+      servoDetachAt = now + 500;
+    } else {
+      servo.write(DANCE_ANGLES[danceStep]);
+    }
+  }
+  if (!danceActive && servoAttached && servoDetachAt != 0 && (int32_t)(now - servoDetachAt) >= 0) {
+    servo.detach();
+    servoAttached = false;
+    servoDetachAt = 0;
+  }
+}
+
+// =====================================================================
+//                           WI-FI / WEATHER
+// =====================================================================
+void wifiService(uint32_t now) {
+  if (WiFi.status() == WL_CONNECTED) return;
+  if ((now - lastWifiAttempt) >= WIFI_RETRY_MS) {
+    lastWifiAttempt = now;
+    Serial.println("Wi-Fi: (re)connecting...");
+    WiFi.disconnect();
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+  }
+}
+
+bool fetchWeather() {
+  WiFiClientSecure client;
+  client.setInsecure();                      // no certificate pinning (simple, fine for weather)
+  HTTPClient http;
+  http.setTimeout(8000);
+  if (!http.begin(client, WEATHER_URL)) return false;
+
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    Serial.printf("Weather HTTP error: %d\n", code);
+    http.end();
+    return false;
+  }
+  String body = http.getString();
+  http.end();
+
+#if ARDUINOJSON_VERSION_MAJOR >= 7
+  JsonDocument doc;                           // ArduinoJson 7
+#else
+  DynamicJsonDocument doc(1024);              // ArduinoJson 6
+#endif
+  DeserializationError err = deserializeJson(doc, body);
+  if (err) { Serial.println("Weather JSON error"); return false; }
+
+  JsonObject cur = doc["current"].as<JsonObject>();
+  if (cur.isNull() || cur["temperature_2m"].isNull() || cur["relative_humidity_2m"].isNull()) {
+    return false;
+  }
+
+  WeatherData w;
+  w.valid = true;
+  w.tempC = cur["temperature_2m"].as<float>();
+  w.humidity = cur["relative_humidity_2m"].as<int>();
+  w.code = cur["weather_code"] | 0;
+  w.updatedAt = millis();
+
+  portENTER_CRITICAL(&weatherMux);
+  weather = w;
+  portEXIT_CRITICAL(&weatherMux);
+  Serial.printf("Weather: %.1fC  %d%%  code %d\n", w.tempC, w.humidity, w.code);
+  return true;
+}
+
+void weatherTask(void* param) {
+  uint32_t lastAttempt = 0;
+  bool first = true;
+  bool lastOk = false;
+  for (;;) {
+    if (WiFi.status() == WL_CONNECTED) {
+      uint32_t now = millis();
+      uint32_t interval = lastOk ? WEATHER_REFRESH_MS : WEATHER_RETRY_MS;
+      if (first || (now - lastAttempt) >= interval) {
+        first = false;
+        lastAttempt = now;
+        weatherFetching = true;
+        lastOk = fetchWeather();
+        weatherLastFailed = !lastOk;
+        weatherFetching = false;
+      }
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+// WMO weather code -> short text (max 10 chars so it fits at text size 2)
+const char* weatherText(int c) {
+  switch (c) {
+    case 0:  return "Clear";
+    case 1:  return "Mostly clr";
+    case 2:  return "Partly cld";
+    case 3:  return "Overcast";
+    case 45: case 48: return "Fog";
+    case 51: case 53: case 55: case 56: case 57: return "Drizzle";
+    case 61: case 63: case 65: case 66: case 67: return "Rain";
+    case 71: case 73: case 75: case 77: return "Snow";
+    case 80: case 81: case 82: return "Showers";
+    case 85: case 86: return "Snow shwr";
+    case 95: return "T-storm";
+    case 96: case 99: return "Storm+hail";
+    default: return "Unknown";
+  }
+}
+
+// =====================================================================
+//                              DRAWING
+// =====================================================================
+// Default GFX font: each character cell is 6*size wide and 8*size tall, but
+// the last column/row of the cell is blank, so the real ink is 6*size-size wide.
+// Text is centred on the ink width and clamped so it can never leave the screen.
+void drawCentered(const char* s, int y, uint8_t size) {
+  if (!displayReady) return;
+  int len = (int)strlen(s);
+  int w = (len > 0) ? (len * 6 * size - size) : 0;
+  int x = (SCREEN_W - w) / 2;
+  if (x < 0) x = 0;
+  display.setTextSize(size);
+  display.setCursor(x, y);
+  display.print(s);
+}
+
+// Two size-2 lines for status messages (each line <= 10 characters).
+void drawTwoLines(const char* l1, const char* l2) {
+  display.setTextColor(C_ON);
+  drawCentered(l1, 12, 2);
+  drawCentered(l2, 36, 2);
+}
+
+void drawStartup() {
+  if (!displayReady) return;
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+  drawCentered("Hey,", 13, 2);
+  drawCentered("I am Mimo!", 37, 2);
+  display.display();
+}
+
+// Repaints Mimo's face only when the expression or the blink phase changed.
+void drawPet(uint32_t now, bool force) {
+  if (!displayReady) return;
+
+  uint8_t phase = blinkPhase(now);                         // 0 open, 1 half-shut, 2 shut
+  if (petState == PET_HAPPY && !BLINK_WHEN_HAPPY) phase = 0;
+
+  uint8_t key = (uint8_t)petState * 3 + phase;
+  if (!force && key == lastPetKey) return;
+  lastPetKey = key;
+
+  switch (petState) {
+    case PET_SAD:
+      drawSadEyes(phase != 0);
+      break;
+    case PET_HAPPY:
+      if (phase == 2) drawBlinkEyes(); else drawHappyEyes();
+      break;
+    case PET_ANGRY:
+      if (phase == 2) drawBlinkEyes(); else drawAngryEyes();
+      break;
+    default: // PET_NORMAL
+      if (phase == 2)      drawBlinkEyes();
+      else if (phase == 1) drawHalfLidEyes();
+      else                 drawEyes(false);
+      break;
+  }
+}
+
+// ===============================
+// NORMAL EYES (design unchanged)
+// ===============================
+void drawNormalEyeShapes() {
+  display.fillRoundRect(18, 14, 34, 38, 15, SH110X_WHITE);
+  display.fillCircle(35, 34, 10, SH110X_BLACK);
+  display.fillCircle(38, 29, 4, SH110X_WHITE);
+
+  display.fillRoundRect(76, 14, 34, 38, 15, SH110X_WHITE);
+  display.fillCircle(93, 34, 10, SH110X_BLACK);
+  display.fillCircle(96, 29, 4, SH110X_WHITE);
+}
+
+void drawEyes(bool closed) {
+  display.clearDisplay();
+
+  if (closed) {
+    display.drawLine(22, 34, 29, 39, SH110X_WHITE);
+    display.drawLine(29, 39, 39, 39, SH110X_WHITE);
+    display.drawLine(39, 39, 46, 34, SH110X_WHITE);
+
+    display.drawLine(82, 34, 89, 39, SH110X_WHITE);
+    display.drawLine(89, 39, 99, 39, SH110X_WHITE);
+    display.drawLine(99, 39, 106, 34, SH110X_WHITE);
+  } else {
+    drawNormalEyeShapes();
+  }
+
+  display.display();
+}
+
+// Middle frame of a blink: the normal eyes with an eyelid covering the top half.
+void drawHalfLidEyes() {
+  display.clearDisplay();
+  drawNormalEyeShapes();
+  display.fillRect(0, 0, SCREEN_W, 33, C_OFF);   // eyes span y=14..51, lid covers y<33
+  display.display();
+}
+
+// ===============================
+// HAPPY EYES (unchanged)
+// ===============================
+void drawHappyEyes() {
+  display.clearDisplay();
+
+  // Left happy eye
+  display.drawLine(18, 39, 25, 29, SH110X_WHITE);
+  display.drawLine(25, 29, 35, 25, SH110X_WHITE);
+  display.drawLine(35, 25, 45, 29, SH110X_WHITE);
+  display.drawLine(45, 29, 52, 39, SH110X_WHITE);
+
+  // Right happy eye
+  display.drawLine(76, 39, 83, 29, SH110X_WHITE);
+  display.drawLine(83, 29, 93, 25, SH110X_WHITE);
+  display.drawLine(93, 25, 103, 29, SH110X_WHITE);
+  display.drawLine(103, 29, 110, 39, SH110X_WHITE);
+
+  display.display();
+}
+
+// ===============================
+// Helpers for the SAD / ANGRY faces
+// ===============================
+static void faceThickLine(int x0, int y0, int x1, int y1, int r, uint16_t c) {
+  int dx = x1 - x0, dy = y1 - y0;
+  int steps = max(abs(dx), abs(dy));
+  if (steps == 0) steps = 1;
+  for (int i = 0; i <= steps; i++) {
+    display.fillCircle(x0 + dx * i / steps, y0 + dy * i / steps, r, c);
+  }
+}
+
+static void faceFillEllipse(int cx, int cy, int rx, int ry, uint16_t c) {
+  for (int dy = -ry; dy <= ry; dy++) {
+    float k = 1.0f - ((float)dy * dy) / ((float)ry * ry);
+    int w = (int)(rx * sqrtf(k < 0 ? 0 : k) + 0.5f);
+    display.drawFastHLine(cx - w, cy + dy, 2 * w + 1, c);
+  }
+}
+
+// Curved, tapered sad eyebrow (quadratic curve). The right brow is the
+// mirror image of the left one (x -> 127 - x).
+static void faceSadBrow(bool mirrored) {
+  const float x0 = 28.5f, y0 = 22.0f;    // outer end (low)
+  const float cx = 38.0f, cy = 22.0f;    // curve control point
+  const float x2 = 45.0f, y2 = 14.5f;    // inner end (high)
+  for (int i = 0; i <= 40; i++) {
+    float t = i / 40.0f, u = 1.0f - t;
+    float x = u * u * x0 + 2 * u * t * cx + t * t * x2;
+    float y = u * u * y0 + 2 * u * t * cy + t * t * y2;
+    int px = (int)(x + 0.5f), py = (int)(y + 0.5f);
+    if (mirrored) px = 127 - px;
+    display.fillCircle(px, py, 1, C_ON);
+    if (t > 0.2f && t < 0.8f) display.fillCircle(px, py + 1, 1, C_ON);  // thicker middle
+  }
+}
+
+// ===============================
+// ANGRY EYES (A1, Final)
+// ===============================
+// White crescent eyes (thick on the outer/bottom side), big dark pupil with a
+// small highlight, a black gap under thick slanted brows pointing to the centre.
+void drawAngryEyes() {
+  display.clearDisplay();
+
+  // Eyes: white disc with a dark pupil shifted toward the centre (leaves a crescent).
+  display.fillCircle(43, 36, 16, C_ON);
+  display.fillCircle(46, 33, 12, C_OFF);
+  display.fillCircle(49, 34, 3, C_ON);               // highlight
+
+  display.fillCircle(85, 36, 16, C_ON);
+  display.fillCircle(82, 33, 12, C_OFF);
+  display.fillCircle(79, 34, 3, C_ON);               // highlight
+
+  // Everything above the brow line is cut away (flat angry lid).
+  display.fillTriangle(0, 2, 64, 34, 64, 0, C_OFF);
+  display.fillTriangle(0, 2, 0, 0, 64, 0, C_OFF);
+  display.fillTriangle(127, 2, 64, 34, 64, 0, C_OFF);
+  display.fillTriangle(127, 2, 127, 0, 64, 0, C_OFF);
+
+  // Dark gap under each brow.
+  faceThickLine(25, 16, 59, 33, 3, C_OFF);
+  faceThickLine(103, 16, 69, 33, 3, C_OFF);
+
+  // Thick rounded brows.
+  faceThickLine(25, 14, 59, 31, 2, C_ON);
+  faceThickLine(103, 14, 69, 31, 2, C_ON);
+
+  display.display();
+}
+
+// ===============================
+// CLOSED EYES (used for the blink)
+// ===============================
+void drawBlinkEyes() {
+  display.clearDisplay();
+  // Soft closed eyelids used for the automatic blink.
+  display.drawLine(19, 35, 27, 41, C_ON);
+  display.drawLine(27, 41, 42, 41, C_ON);
+  display.drawLine(42, 41, 51, 35, C_ON);
+  display.drawLine(77, 35, 85, 41, C_ON);
+  display.drawLine(85, 41, 100, 41, C_ON);
+  display.drawLine(100, 41, 109, 35, C_ON);
+  display.display();
+}
+
+// ===============================
+// SAD EYES (S1, Final)
+// ===============================
+// Round ring eyes, big oval highlight (upper right) + small dot (lower left),
+// curved worried eyebrows that are high on the inner side.
+void drawSadEyes(bool closed) {
+  display.clearDisplay();
+
+  if (closed) {
+    // Gentle closed-eye blink (the new eyebrows stay).
+    display.drawLine(30, 40, 36, 44, C_ON);
+    display.drawLine(36, 44, 50, 44, C_ON);
+    display.drawLine(50, 44, 56, 40, C_ON);
+    display.drawLine(71, 40, 77, 44, C_ON);
+    display.drawLine(77, 44, 91, 44, C_ON);
+    display.drawLine(91, 44, 97, 40, C_ON);
+  } else {
+    // Rings: white outer circle, black inside (centres 41 px apart, 13 px gap).
+    display.fillCircle(43, 38, 14, C_ON);
+    display.fillCircle(43, 38, 11, C_OFF);
+    display.fillCircle(84, 38, 14, C_ON);
+    display.fillCircle(84, 38, 11, C_OFF);
+
+    // Big oval highlights (upper right) and small round dots (lower left).
+    faceFillEllipse(47, 34, 5, 3, C_ON);
+    display.fillCircle(38, 43, 2, C_ON);
+    faceFillEllipse(88, 34, 5, 3, C_ON);
+    display.fillCircle(79, 43, 2, C_ON);
+  }
+
+  // Curved eyebrows.
+  faceSadBrow(false);
+  faceSadBrow(true);
+
+  display.display();
+}
+
+// ===============================
+// MENU (same three items)
+// ===============================
+void drawMenu(bool force) {
+  if (!displayReady) return;
+  static uint8_t lastIndex = 0xFF;
+  if (!force && lastIndex == menuIndex) return;
+  lastIndex = menuIndex;
+
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+  drawCentered("MIMO MENU", 1, 1);
+  for (uint8_t i = 0; i < 3; i++) {
+    int y = 12 + i * 17;
+    bool sel = (i == menuIndex);
+    if (sel) display.fillRect(0, y - 1, SCREEN_W, 17, C_ON);
+    display.setTextColor(sel ? C_OFF : C_ON);
+    display.setTextSize(2);
+    display.setCursor(4, y);
+    display.print(MENU_ITEMS[i]);
+  }
+  display.display();
+}
+
+// ===============================
+// CLOCK
+// ===============================
+// Vertical layout (ink rows, 64 px tall):
+//   date     size 2 : y  1..14   "Fri 06 Nov" (10 chars = 119 px wide)
+//   time     size 3 : y 20..40   "12:45" (87 px) + AM/PM size 2 beside it
+//   seconds  size 2 : y 47..60   "SEC 05"
+// Widest case: 87 + 6 gap + 22 = 115 px, centred, so everything stays inside 128x64.
+void drawClock(bool force) {
+  if (!displayReady) return;
+
+  time_t nowT = time(nullptr);
+  bool synced = (nowT >= 1700000000);
+
+  // Repaint only when the shown second changes (or the status text changes).
+  uint32_t sig = synced ? (uint32_t)nowT : (WiFi.status() == WL_CONNECTED ? 1u : 0u);
+  static uint32_t lastSig = 0xFFFFFFFFu;
+  if (!force && sig == lastSig) return;
+  lastSig = sig;
+
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+
+  if (!synced) {
+    if (WiFi.status() == WL_CONNECTED) drawTwoLines("Syncing", "time...");
+    else                               drawTwoLines("Connect", "WiFi...");
+    display.display();
+    return;
+  }
+
+  struct tm t;
+  localtime_r(&nowT, &t);
+
+  char dateBuf[16], timeBuf[8], secBuf[10];
+  strftime(dateBuf, sizeof(dateBuf), "%a %d %b", &t);       // e.g. "Fri 06 Nov"
+  int h12 = t.tm_hour % 12;
+  if (h12 == 0) h12 = 12;
+  snprintf(timeBuf, sizeof(timeBuf), "%d:%02d", h12, t.tm_min);
+  snprintf(secBuf, sizeof(secBuf), "SEC %02d", t.tm_sec);
+
+  // Date
+  drawCentered(dateBuf, 1, 2);
+
+  // Time (size 3) with AM/PM (size 2) bottom-aligned beside it
+  const int timeW  = (int)strlen(timeBuf) * 18 - 3;         // size-3 glyph pitch is 18 px
+  const int ampmW  = 2 * 12 - 2;                            // "AM"/"PM" at size 2
+  const int gap    = 6;
+  int x0 = (SCREEN_W - (timeW + gap + ampmW)) / 2;
+  if (x0 < 0) x0 = 0;
+  display.setTextSize(3);
+  display.setCursor(x0, 20);
+  display.print(timeBuf);
+  display.setTextSize(2);
+  display.setCursor(x0 + timeW + gap, 26);
+  display.print(t.tm_hour >= 12 ? "PM" : "AM");
+
+  // Seconds
+  drawCentered(secBuf, 47, 2);
+
+  display.display();
+}
+
+// ===============================
+// WEATHER
+// ===============================
+// Vertical layout (ink rows):
+//   temperature  size 3 : y  2..22   "31.4" + degree ring + "C" (size 2)
+//   humidity     size 2 : y 29..42   "Humid 72%"  (max 10 chars = 119 px)
+//   condition    size 2 : y 48..61   e.g. "Partly cld" (max 10 chars)
+//   SYNC / OLD   size 1 : top-right corner (x>=104, y 0..6), clear of the temperature
+void drawWeather(uint32_t now, bool force) {
+  if (!displayReady) return;
+
+  WeatherData w;
+  portENTER_CRITICAL(&weatherMux);
+  w = weather;
+  portEXIT_CRITICAL(&weatherMux);
+
+  bool fetching = weatherFetching;
+  bool failed   = weatherLastFailed;
+  bool wifiOk   = (WiFi.status() == WL_CONNECTED);
+  bool stale    = w.valid && (now - w.updatedAt) > WEATHER_STALE_MS;
+
+  // Repaint only when something that is shown has changed.
+  uint32_t sig = w.updatedAt * 31u
+               + (fetching ? 1u : 0u) + (stale ? 2u : 0u) + (wifiOk ? 4u : 0u)
+               + (failed ? 8u : 0u) + (w.valid ? 16u : 0u);
+  static uint32_t lastSig = 0xFFFFFFFFu;
+  if (!force && sig == lastSig) return;
+  lastSig = sig;
+
+  display.clearDisplay();
+  display.setTextColor(C_ON);
+
+  if (!w.valid) {
+    if (!wifiOk)                    drawTwoLines("No WiFi", "Reconnect");
+    else if (failed && !fetching)   drawTwoLines("Weather", "Error");
+    else                            drawTwoLines("Loading", "weather..");
+    display.display();
+    return;
+  }
+
+  // Small status tag, top-right
+  const char* status = "";
+  if (fetching) status = "SYNC";
+  else if (stale) status = "OLD";
+  if (status[0] != '\0') {
+    display.setTextSize(1);
+    display.setCursor(SCREEN_W - ((int)strlen(status) * 6 - 1), 0);
+    display.print(status);
+  }
+
+  // Temperature: big digits, degree ring, "C"
+  char tempBuf[12];
+  snprintf(tempBuf, sizeof(tempBuf), "%.1f", w.tempC);
+  const int tempW  = (int)strlen(tempBuf) * 18 - 3;
+  const int totalW = tempW + 11 + 10;                       // digits + degree gap + "C"
+  int x0 = (SCREEN_W - totalW) / 2;
+  if (x0 < 0) x0 = 0;
+  display.setTextSize(3);
+  display.setCursor(x0, 2);
+  display.print(tempBuf);
+  display.drawCircle(x0 + tempW + 6, 5, 2, C_ON);           // degree ring
+  display.setTextSize(2);
+  display.setCursor(x0 + tempW + 11, 9);
+  display.print("C");
+
+  // Humidity on its own line
+  int hum = w.humidity;
+  if (hum < 0) hum = 0;
+  if (hum > 100) hum = 100;
+  char humBuf[16];
+  snprintf(humBuf, sizeof(humBuf), "Humid %d%%", hum);
+  drawCentered(humBuf, 29, 2);
+
+  // Condition on its own line
+  drawCentered(weatherText(w.code), 48, 2);
+
+  display.display();
+}
