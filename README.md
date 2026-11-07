@@ -75,4 +75,4 @@ Mimo-Digital-Pet/
 
 ---
 
-**Built with creativity and curiosity. ❤️**
+**Built with Creativity and Curiosity. ❤️**
